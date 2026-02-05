@@ -1,111 +1,102 @@
-import cv2
-import math
-import os
+import cv2, os, sys, csv, shutil, tkinter as tk
+from tkinter import filedialog
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+from pose_utils import *
 
-# ==============================
-# USER INPUT (REAL HEIGHT)
-# ==============================
-USER_HEIGHT_CM = float(input("Enter your real height (cm): "))
-
-IMAGE_DIR = "data/captured"
+MODE = sys.argv[1]  # captured / uploaded
 MODEL_PATH = "desktop/models/pose_landmarker_lite.task"
 
-# ==============================
-# Load image
-# ==============================
-images = sorted(os.listdir(IMAGE_DIR))
-image_path = os.path.join(IMAGE_DIR, images[-1])
+# ---------- IMAGE SELECTION ----------
+if MODE == "captured":
+    imgs = sorted(os.listdir("data/captured"))
+    if not imgs:
+        print("❌ No captured image"); exit()
+    image_path = os.path.join("data/captured", imgs[-1])
 
-image = cv2.imread(image_path)
-h, w, _ = image.shape
-rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+elif MODE == "uploaded":
+    os.makedirs("data/uploaded", exist_ok=True)
+    root = tk.Tk(); root.withdraw()
+    src = filedialog.askopenfilename(filetypes=[("Images","*.jpg *.png")])
+    if not src:
+        exit()
+    image_path = "data/uploaded/upload.jpg"
+    shutil.copy(src, image_path)
 
-# ==============================
-# MediaPipe Pose (IMAGE mode)
-# ==============================
+else:
+    exit()
+
+# ---------- LOAD IMAGE ----------
+img = cv2.imread(image_path)
+h, w, _ = img.shape
+rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+# ---------- MEDIAPIPE ----------
 BaseOptions = python.BaseOptions
 PoseLandmarker = vision.PoseLandmarker
 PoseLandmarkerOptions = vision.PoseLandmarkerOptions
-RunningMode = vision.RunningMode
 
 options = PoseLandmarkerOptions(
     base_options=BaseOptions(model_asset_path=MODEL_PATH),
-    running_mode=RunningMode.IMAGE
+    running_mode=vision.RunningMode.IMAGE
 )
 
 landmarker = PoseLandmarker.create_from_options(options)
 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-result = landmarker.detect(mp_image)
+res = landmarker.detect(mp_image)
 
-if not result.pose_landmarks:
-    print("❌ No pose detected")
-    exit()
+if not res.pose_landmarks:
+    print("❌ No pose detected"); exit()
 
-lm = result.pose_landmarks[0]
+lm = res.pose_landmarks[0]
 
-# ==============================
-# Helper functions
-# ==============================
-def px(p1, p2):
-    return math.sqrt(
-        (p1.x*w - p2.x*w)**2 +
-        (p1.y*h - p2.y*h)**2
-    )
+# ---------- VALIDATION ----------
+if confidence(lm) < 0.7:
+    print("❌ Low confidence pose"); exit()
 
-# ==============================
-# LANDMARK INDEXES
-# ==============================
-NOSE = 0
-LS, RS = 11, 12
-LE, RE = 13, 14
-LW, RW = 15, 16
-LH, RH = 23, 24
-LA, RA = 27, 28
+bt = body_type(lm)
+if bt == "reject":
+    print("❌ Bad framing"); exit()
 
-# ==============================
-# HEIGHT (PIXELS → CM SCALE)
-# ==============================
-pixel_height = px(lm[NOSE], lm[LA])
-scale = USER_HEIGHT_CM / pixel_height
+height_cm = float(input("Enter your height (cm): "))
 
-# ==============================
-# MEASUREMENTS (PIXELS)
-# ==============================
-measurements_px = {
-    "shoulder_width": px(lm[LS], lm[RS]),
-    "chest_width": px(lm[LS], lm[RS]) * 0.9,
-    "waist_width": px(lm[LH], lm[RH]) * 0.85,
-    "hip_width": px(lm[LH], lm[RH]),
-    "torso_length": px(lm[LS], lm[LH]),
-    "arm_length": px(lm[LS], lm[LW]),
-    "leg_length": px(lm[LH], lm[LA])
-}
+# ---------- SCALE ----------
+if bt == "full":
+    px_height = px_dist(lm[HEAD], lm[LA], w, h)
+else:
+    px_height = px_dist(lm[LS], lm[LH], w, h) * 2.3
 
-# ==============================
-# CONVERT TO CM
-# ==============================
-measurements_cm = {
-    k: round(v * scale, 2)
-    for k, v in measurements_px.items()
-}
+scale = height_cm / px_height
 
-# ==============================
-# OUTPUT
-# ==============================
+# ---------- MEASUREMENTS ----------
+m = {}
+
+m["shoulder_width"] = px_dist(lm[LS], lm[RS], w, h) * scale
+m["chest_width"] = px_dist(lm[LE], lm[RE], w, h) * scale
+m["waist_width"] = px_dist(lm[LH], lm[RH], w, h) * scale
+m["torso_length"] = px_dist(lm[LS], lm[LH], w, h) * scale
+m["arm_length"] = px_dist(lm[LS], lm[LW], w, h) * scale
+
+if bt == "full":
+    m["hip_width"] = px_dist(lm[LH], lm[RH], w, h) * scale
+    m["leg_length"] = px_dist(lm[LH], lm[LA], w, h) * scale
+
+# ---------- SAVE ----------
+os.makedirs("data/measurements", exist_ok=True)
+csv_path = "data/measurements/measurements.csv"
+
+write_header = not os.path.exists(csv_path)
+
+with open(csv_path, "a", newline="") as f:
+    writer = csv.writer(f)
+    if write_header:
+        writer.writerow(m.keys())
+    writer.writerow([round(v,2) for v in m.values()])
+
+# ---------- DISPLAY ----------
 print("\n📐 BODY MEASUREMENTS (cm)\n")
-for k, v in measurements_cm.items():
-    print(f"{k.replace('_',' ').title():<20}: {v} cm")
+for k,v in m.items():
+    print(f"{k.replace('_',' ').title():20}: {v:.2f}")
 
-# ==============================
-# VISUAL DEBUG
-# ==============================
-for p in lm:
-    cv2.circle(image, (int(p.x*w), int(p.y*h)), 3, (0,255,0), -1)
-
-cv2.imshow("Pose + Measurements", image)
-cv2.waitKey(0)
-cv2.destroyAllWindows()
 landmarker.close()
