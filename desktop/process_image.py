@@ -14,7 +14,7 @@ MODEL_PATH = os.path.join(SCRIPT_DIR, "models", "pose_landmarker_lite.task")
 def process_image(image_path, height_cm):
     img = cv2.imread(image_path)
     if img is None:
-        return None, "Image not found or invalid format"
+        return None, "Image not found or invalid format", None
 
     h, w, _ = img.shape
     rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -25,7 +25,7 @@ def process_image(image_path, height_cm):
     
     # Check explicitly before crashing
     if not os.path.exists(MODEL_PATH):
-        return None, f"Model not found at {MODEL_PATH}"
+        return None, f"Model not found at {MODEL_PATH}", None
 
     options = PoseLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=MODEL_PATH),
@@ -37,94 +37,185 @@ def process_image(image_path, height_cm):
     res = landmarker.detect(mp_image)
 
     if not res.pose_landmarks:
-        return None, "No pose detected"
+        return None, "No pose detected", None
 
     lm = res.pose_landmarks[0]
 
-    if confidence(lm) < 0.6: # Relaxed slightly
-        return None, "Low confidence pose"
-
-    # --- IMPROVED MEASUREMENT LOGIC ---
+    # --- DRAWING LANDMARKS ---
+    annotated_img = img.copy()
     
-    # helper for distance
+    # Draw logic manually or use mp defaults
+    # Using mediapipe drawing utils is easier if available for standard Pose, 
+    # but the Task API returns landmarks slightly differently than the old Solution API.
+    # We'll manually draw for control or use a helper if we import it.
+    # Simple manual draw for key points:
+    
+    # Colors (Myntra-ish: Pink/Orange/White)
+    COLOR_POINT = (0, 255, 0) # Green for valid
+    COLOR_LINE = (255, 255, 255)
+    
+    connections = [
+        (11, 12), (11, 13), (13, 15), # Arms
+        (12, 14), (14, 16),
+        (11, 23), (12, 24), # Torso
+        (23, 24),
+        (23, 25), (25, 27), # Legs
+        (24, 26), (26, 28)
+    ]
+    
+    # Draw Lines
+    for start, end in connections:
+        if start < len(lm) and end < len(lm):
+            p1 = lm[start]
+            p2 = lm[end]
+            if visible(p1) and visible(p2):
+                x1, y1 = int(p1.x * w), int(p1.y * h)
+                x2, y2 = int(p2.x * w), int(p2.y * h)
+                cv2.line(annotated_img, (x1, y1), (x2, y2), COLOR_LINE, 2)
+    
+    # Draw Points
+    for i, p in enumerate(lm):
+        if visible(p):
+            cx, cy = int(p.x * w), int(p.y * h)
+            cv2.circle(annotated_img, (cx, cy), 4, COLOR_POINT, -1)
+            # cv2.putText(annotated_img, str(i), (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0,0,255), 1)
+
+    # Save Annotated Image
+    processed_dir = os.path.join(PROJECT_ROOT, "data", "processed")
+    os.makedirs(processed_dir, exist_ok=True)
+    
+    # Simple robust naming: processed_<original_name>
+    filename = f"processed_{os.path.basename(image_path)}"
+    annotated_path = os.path.join(processed_dir, filename)
+    cv2.imwrite(annotated_path, annotated_img)
+
+
+    if confidence(lm) < 0.6: 
+        return None, "Low confidence pose", annotated_path
+
+    # --- ADVANCED MEASUREMENT LOGIC ---
+    
+    # helper for euclidean distance
     def dist(i1, i2):
         return px_dist(lm[i1], lm[i2], w, h)
 
-    # 1. Calculate Pixels per CM (Scale)
-    # Use Eye-level to Ankle-level for height if full body
-    # Standard head-to-body ratio is approx 1:7.5 or 1:8
+    # 1. Pose Validation (Risk Assessment)
+    # Check if shoulder width is too narrow compared to torso height (Side View?)
+    shoulder_px_width = abs(lm[11].x - lm[12].x) * w
+    torso_px_height = abs((lm[11].y+lm[12].y)/2 - (lm[23].y+lm[24].y)/2) * h
     
-    # Determine accessible height in pixels
-    # If we have feet, use (Nose Y - Ankle Y) and adjust for Head top/Foot bottom
-    # MediaPipe: 0=Nose, 27/28=Ankles, 31/32=Feet tips
-    
+    orientation_warning = None
+    if shoulder_px_width < 0.45 * torso_px_height:
+        orientation_warning = "⚠️ Side/Angled view detected. Results may be inaccurate."
+
+    # 2. Scale Calibration (Pixels per CM)
     # Robust height estimation
     ankles_y = (lm[27].y + lm[28].y) / 2 if (visible(lm[27]) and visible(lm[28])) else None
     
-    if ankles_y: # Full body visible
-        # Nose to Ankle is approx 85-88% of full height usually
+    if ankles_y: 
+        # Full Body: Nose (0) to Ankle Midpoint
         px_height_segment = abs(lm[0].y - ankles_y) * h
-        # Estimated full height in pixels (adding head top and feeet offset)
-        px_full_height = px_height_segment * 1.15 
+        # Standard Anatomy: Nose-to-Ankle is ~86% of full height
+        px_full_height = px_height_segment / 0.86
     else:
-        # Upper body only fallback (approximate from torso)
-        # Torso (Shoulder to Hip) is approx 30% of height
-        mid_shoulder_y = (lm[11].y + lm[12].y) / 2
-        mid_hip_y = (lm[23].y + lm[24].y) / 2
-        px_torso = abs(mid_shoulder_y - mid_hip_y) * h
-        px_full_height = px_torso * 3.3  # Rough estimation
+        # Upper Body: Mid-Shoulder to Mid-Hip
+        mid_s_y = (lm[11].y + lm[12].y) / 2
+        mid_h_y = (lm[23].y + lm[24].y) / 2
+        px_torso = abs(mid_s_y - mid_h_y) * h
+        # Torso is approx 30% of height
+        px_full_height = px_torso / 0.30
     
     scale = height_cm / px_full_height # cm per pixel
 
-    # 2. Width & Girth Estimations (with curvature multipliers)
-    # Straight line distance through body is < circumferential diameter
-    # We apply multipliers to approximate "size" properly.
+    # 3. Clothing Metrics Calculation (Circumference Estimation)
     
-    # Shoulders
-    # Bone-to-bone width (acromial). For "Measure" usually we want garment width.
-    shoulder_px = dist(11, 12) 
-    shoulder_width = shoulder_px * scale * 1.1 # Multiplier for skin/muscle
+    # We measure 2D 'width' from camera. Clothing uses 'Girth' (Circumference).
+    # Humans are roughly elliptical. 
+    # Girth approx = Width * Multiplier
+    # Multiplier varies: Neck ~3.0, Waist ~2.7, Chest ~2.6 (arms block view)
+    
+    def to_girth(width_cm, multiplier=2.8):
+        return width_cm * multiplier
 
-    # Chest
-    # Interpolated point between shoulder and hip? 
-    # Or simple Shoulder width adjusted? 
-    # Let's approximate Chest width at armpit level roughly equal to shoulder bone width for men, 
-    # often wider/different for women. Simplified:
-    chest_px = dist(11, 12) * 0.9  # Roughly underarm width
-    chest_width = chest_px * scale * 1.15 # Multiplier for depth
+    # A. Shoulders (Bi-acromial Width) - LINEAR
+    shoulder_px = dist(11, 12)
+    shoulder_width = shoulder_px * scale * 1.0 
+    
+    # B. Chest (Underarm) - CIRCUMFERENCE
+    # Visible width is often reduced by arms or posture.
+    chest_px = dist(11, 12) * 0.95 
+    chest_width_2d = chest_px * scale
+    # Chest depth is significant.
+    chest_circ = to_girth(chest_width_2d, 2.7)
+    
+    # C. Waist (Natural Waist) - CIRCUMFERENCE
+    hip_width_px = dist(23, 24)
+    # Natural waist is narrower than hips
+    waist_px = hip_width_px * 0.82 
+    waist_width_2d = waist_px * scale
+    waist_circ = to_girth(waist_width_2d, 2.85) # Waists are often more circular
+    
+    # D. Hips (Widest Point) - CIRCUMFERENCE
+    # 23/24 are Iliac crests. Trochanter (widest) is wider.
+    hip_bone_width = dist(23, 24) * scale
+    hip_max_width = hip_bone_width * 1.15
+    hip_circ = to_girth(hip_max_width, 2.9) # Hips are wide and deep
+    
+    # E. Sleeve Length - LINEAR
+    arm_px = dist(11, 13) + dist(13, 15)
+    sleeve_length = arm_px * scale
+    
+    # F. Inseam - LINEAR
+    leg_ext = (dist(23, 25) + dist(25, 27)) * scale if ankles_y else 0
+    inseam = leg_ext * 0.85 if leg_ext > 0 else 0
 
-    # Waist
-    # Hips in MediaPipe are iliac crestish.
-    hip_px = dist(23, 24)
-    waist_width = hip_px * scale * 1.15
-
-    # Torso Length (Vertical)
-    # Shoulder mid to Hip mid
-    mid_s = ((lm[11].x+lm[12].x)/2, (lm[11].y+lm[12].y)/2)
-    mid_h = ((lm[23].x+lm[24].x)/2, (lm[23].y+lm[24].y)/2)
-    # Manual Euclidean dist since they are coords not landmark objects
-    torso_px = math.sqrt(((mid_s[0]-mid_h[0])*w)**2 + ((mid_s[1]-mid_h[1])*h)**2) 
-    torso_length = torso_px * scale
-
-    # Arm Length 
-    # Shoulder to Wrist
-    # Sum segments for better accuracy if arm is bent: Shoulder->Elbow + Elbow->Wrist
-    arm_px = dist(11, 13) + dist(13, 15) # Left Arm
-    arm_length = arm_px * scale
+    # G. Neck - CIRCUMFERENCE
+    # Neck width is approx 38% of shoulder width?
+    neck_width = shoulder_width * 0.38
+    neck_circ = to_girth(neck_width, 3.0)
 
     m = {
         "Height (Ref)": height_cm,
         "Shoulder Width": shoulder_width,
-        "Chest Width": chest_width,
-        "Waist Width": waist_width,
-        "Torso Length": torso_length,
-        "Arm Length": arm_length,
+        "Chest (Girth)": chest_circ,
+        "Waist (Girth)": waist_circ,
+        "Hips (Girth)": hip_circ,
+        "Neck (Girth)": neck_circ,
+        "Sleeve Length": sleeve_length,
+        "Inseam": inseam
     }
 
-    if ankles_y: # Full body extras
-        # Leg: Hip to Ankle (Hip->Knee + Knee->Ankle)
-        leg_px = dist(23, 25) + dist(25, 27)
-        m["Leg Length"] = leg_px * scale
+    # --- ANNOTATE MEASUREMENTS ON IMAGE ---
+    # Helper to draw dimension line
+    def draw_dim(idx1, idx2, text, offset_y=0):
+        if visible(lm[idx1]) and visible(lm[idx2]):
+            p1 = (int(lm[idx1].x * w), int(lm[idx1].y * h))
+            p2 = (int(lm[idx2].x * w), int(lm[idx2].y * h))
+            mid = ((p1[0]+p2[0])//2, (p1[1]+p2[1])//2 + offset_y)
+            cv2.line(annotated_img, p1, p2, (0, 255, 255), 2) 
+            cv2.putText(annotated_img, text, (mid[0]-40, mid[1]-10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2, cv2.LINE_AA)
+
+    if orientation_warning:
+        cv2.putText(annotated_img, "WARNING: Pose Risk", (20, 50), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+    draw_dim(11, 12, f"Sh: {shoulder_width:.1f}", -20)
+    draw_dim(23, 24, f"HipBone: {hip_bone_width:.1f}", 20)
+    
+    # Visualizing Natural Waist (Interpolated)
+    wx1 = int( (lm[23].x + (lm[11].x - lm[23].x) * 0.15) * w )
+    wy1 = int( (lm[23].y + (lm[11].y - lm[23].y) * 0.15) * h )
+    wx2 = int( (lm[24].x + (lm[12].x - lm[24].x) * 0.15) * w )
+    wy2 = int( (lm[24].y + (lm[12].y - lm[24].y) * 0.15) * h )
+    cv2.line(annotated_img, (wx1, wy1), (wx2, wy2), (255, 0, 255), 2)
+    # Label with Girth for user clarity? Or Width? Maybe Girth since that's what they care about.
+    # But visually it's a line of width. Let's show "Waist" and user checks text for value.
+    cv2.putText(annotated_img, f"Waist", (wx1, wy1-10), 
+               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+    
+    # Optional: Draw Chest Line
+    draw_dim(11, 12, "Chest", 40)
 
     # Save CSV
     measurements_dir = os.path.join(PROJECT_ROOT, "data", "measurements")
@@ -139,4 +230,4 @@ def process_image(image_path, height_cm):
         writer.writerow([round(v,2) for v in m.values()])
 
     landmarker.close()
-    return m, None
+    return m, None, annotated_path
